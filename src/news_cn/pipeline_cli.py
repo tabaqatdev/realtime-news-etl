@@ -160,11 +160,26 @@ class UnifiedPipeline:
             scraper = ModernArticleScraper()
             articles_file = self.articles_dir / "enriched_articles.parquet"
 
-            # Enable resume by passing output_file
+            # Determine which events file to use for merging
+            if deduplicate and (self.cleaned_dir / "deduplicated_events.parquet").exists():
+                base_file = str(self.cleaned_dir / "deduplicated_events.parquet")
+            else:
+                base_file = str(self.cleaned_dir / "cleaned_events.parquet")
+
+            if enrich_geo:
+                events_file = str(self.cleaned_dir / "geo_enriched.parquet")
+            else:
+                events_file = base_file
+
+            final_output = self.cleaned_dir / "final_enriched.parquet"
+
+            # Enable resume by passing output_file + incremental merge
             articles = scraper.enrich_events_with_content(
                 parquet_pattern=str(self.parquet_dir / "events/**/*.parquet"),
                 limit=limit,
                 output_file=articles_file,  # Enable resume capability
+                events_file=events_file,  # For incremental merge
+                final_output_file=final_output,  # Final merged output
             )
 
             # Save scraped articles to Parquet (final save)
@@ -185,26 +200,12 @@ class UnifiedPipeline:
                 print(f"✅ Scraped {articles_scraped} new articles → {articles_file}")
                 print(f"📊 Total articles in database: {total_count}")
 
-                # Merge with geo-enriched events to create final comprehensive output
-                print("\n🔗 Merging articles with geo-enriched events...")
-
-                # Determine which events file to use (deduplicated if available)
-                if deduplicate and (self.cleaned_dir / "deduplicated_events.parquet").exists():
-                    base_file = str(self.cleaned_dir / "deduplicated_events.parquet")
-                else:
-                    base_file = str(self.cleaned_dir / "cleaned_events.parquet")
-
-                if enrich_geo:
-                    events_file = str(self.cleaned_dir / "geo_enriched.parquet")
-                else:
-                    events_file = base_file
-
-                final_output = str(self.cleaned_dir / "final_enriched.parquet")
-
+                # Final merge (already done incrementally, this is just a final update)
+                print("\n🔗 Final merge with geo-enriched events...")
                 merge_stats = scraper.merge_articles_with_events(
                     events_parquet=events_file,
                     articles_parquet=str(articles_file),
-                    output_parquet=final_output,
+                    output_parquet=str(final_output),
                 )
 
                 print(

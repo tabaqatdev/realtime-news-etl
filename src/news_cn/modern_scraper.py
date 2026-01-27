@@ -6,9 +6,16 @@ Strategy: Trafilatura → Newspaper4k → Playwright
 
 import asyncio
 import logging
+import warnings
 from pathlib import Path
 
 import duckdb
+
+# Suppress urllib3 retry warnings - we handle retries ourselves with fast-fail
+from urllib3.exceptions import InsecureRequestWarning
+
+warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +71,15 @@ class ModernArticleScraper:
         else:
             logger.info(f"Available methods: {', '.join(self.methods_available)}")
 
-    def fetch_with_trafilatura(self, url: str, timeout: int = 10) -> dict | None:
+    def fetch_with_trafilatura(self, url: str, timeout: int = 5) -> dict | None:
         """
         Fetch article using Trafilatura (F1: 0.958, fastest)
 
+        Uses custom requests session with disabled retries for fast SSL failure.
+
         Args:
             url: Article URL
-            timeout: Request timeout in seconds (default: 10)
+            timeout: Request timeout in seconds (default: 5 for fast fail)
 
         Returns:
             Dictionary with article content or None if failed
@@ -81,9 +90,32 @@ class ModernArticleScraper:
         try:
             logger.debug(f"Attempting Trafilatura fetch: {url}")
 
-            # Download content with timeout
-            # Set no_ssl=True to skip SSL errors quickly
-            downloaded = trafilatura.fetch_url(url, no_ssl=True)
+            # CRITICAL: Bypass trafilatura.fetch_url() to avoid urllib3 retries
+            # Use requests directly with no retries and short timeout
+            import requests
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+
+            # Create session with NO retries
+            session = requests.Session()
+            retry_strategy = Retry(
+                total=0,  # NO retries
+                connect=0,
+                read=0,
+                redirect=2,
+                status=0,
+                backoff_factor=0,
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+
+            # Fetch with timeout
+            response = session.get(
+                url, timeout=timeout, verify=False
+            )  # Skip SSL verification for speed
+            response.raise_for_status()
+            downloaded = response.text
             if not downloaded:
                 return {
                     "url": url,
@@ -133,17 +165,54 @@ class ModernArticleScraper:
             }
 
         except Exception as e:
+            import requests
+
             error_str = str(e)
-            # Fast fail on SSL/TLS errors (don't retry)
-            if "SSL" in error_str or "ssl" in error_str.lower():
-                logger.debug(f"SSL error for {url}, skipping retries")
+
+            # Fast fail on SSL/TLS errors - these now fail immediately (no retries)
+            if (
+                isinstance(e, requests.exceptions.SSLError)
+                or "SSL" in error_str
+                or "ssl" in error_str.lower()
+            ):
+                logger.debug(f"SSL error for {url}: {type(e).__name__}")
                 return {
                     "url": url,
                     "status": "ssl_error",
                     "method": "trafilatura",
                     "error": "ssl_error",
                 }
-            logger.debug(f"Trafilatura failed for {url}: {e}")
+
+            # Handle HTTP errors (403, 404, etc.) - also fast fail
+            if isinstance(e, requests.exceptions.HTTPError):
+                status_code = e.response.status_code if e.response else "unknown"
+                logger.debug(f"HTTP {status_code} for {url}")
+                return {
+                    "url": url,
+                    "status": f"http_{status_code}",
+                    "method": "trafilatura",
+                    "error": f"http_{status_code}",
+                }
+
+            # Handle timeouts - fast fail
+            if isinstance(
+                e,
+                (
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ReadTimeout,
+                ),
+            ):
+                logger.debug(f"Timeout for {url}")
+                return {
+                    "url": url,
+                    "status": "timeout",
+                    "method": "trafilatura",
+                    "error": "timeout",
+                }
+
+            # Other errors
+            logger.debug(f"Trafilatura failed for {url}: {type(e).__name__}: {e}")
             return {"url": url, "status": "failed", "method": "trafilatura", "error": str(e)}
 
     def fetch_with_newspaper4k(self, url: str) -> dict | None:
@@ -384,6 +453,8 @@ class ModernArticleScraper:
         parquet_pattern: str = "data/parquet/events/**/*.parquet",
         limit: int = 10,
         output_file: Path | str | None = None,
+        events_file: Path | str | None = None,
+        final_output_file: Path | str | None = None,
     ) -> list:
         """
         Read events from parquet and enrich with article content
@@ -393,6 +464,8 @@ class ModernArticleScraper:
             parquet_pattern: Glob pattern for parquet files
             limit: Maximum number of articles to fetch
             output_file: Output file path for incremental saves (enables resume)
+            events_file: Path to geo-enriched events file for merging
+            final_output_file: Path to final merged output (geo + articles)
 
         Returns:
             List of enriched events
@@ -494,6 +567,16 @@ class ModernArticleScraper:
                     if output_file and len(enriched) % 10 == 0:
                         self._save_incremental(enriched, output_file, append=True)
                         logger.info(f"💾 Progress saved: {len(enriched)} articles scraped so far")
+
+                        # Also update final merged output if events_file provided
+                        if events_file and final_output_file:
+                            try:
+                                self.merge_articles_with_events(
+                                    events_file, str(output_file), str(final_output_file)
+                                )
+                                logger.info(f"🔗 Final merged output updated: {final_output_file}")
+                            except Exception as e:
+                                logger.warning(f"Could not update final merged output: {e}")
 
         # Run async processing
         try:

@@ -486,17 +486,34 @@ class ModernArticleScraper:
         """
         con = duckdb.connect(":memory:")
 
-        # Check for existing output to resume from previous run
-        already_scraped = set()
+        # Check for existing attempts (both successful and failed) to skip on resume
+        already_attempted = set()
+
+        # Load successful scrapes from output file
         if output_file and Path(output_file).exists():
             try:
                 existing = con.execute(
                     f"SELECT DISTINCT url FROM read_parquet('{output_file}')"
                 ).fetchall()
-                already_scraped = {row[0] for row in existing}
-                logger.info(f"🔄 Resume mode: Found {len(already_scraped)} already-scraped URLs")
+                already_attempted.update(row[0] for row in existing)
             except Exception as e:
                 logger.warning(f"Could not read existing output for resume: {e}")
+
+        # Load failed attempts from tracking file
+        failed_file = Path(output_file).parent / "failed_urls.parquet" if output_file else None
+        if failed_file and failed_file.exists():
+            try:
+                failed = con.execute(
+                    f"SELECT DISTINCT url FROM read_parquet('{failed_file}')"
+                ).fetchall()
+                already_attempted.update(row[0] for row in failed)
+            except Exception as e:
+                logger.warning(f"Could not read failed URLs for resume: {e}")
+
+        if already_attempted:
+            logger.info(
+                f"🔄 Resume mode: Skipping {len(already_attempted)} already-attempted URLs (success + failed)"
+            )
 
         # Get unique URLs from events
         query = f"""
@@ -521,11 +538,11 @@ class ModernArticleScraper:
 
         all_rows = con.execute(query).fetchall()
 
-        # Filter out already-scraped URLs
-        if already_scraped:
-            rows = [row for row in all_rows if row[0] not in already_scraped]
+        # Filter out already-attempted URLs (both successful and failed)
+        if already_attempted:
+            rows = [row for row in all_rows if row[0] not in already_attempted]
             logger.info(
-                f"📊 Progress: {len(already_scraped)} done, {len(rows)} remaining, {len(all_rows)} total"
+                f"📊 Progress: {len(already_attempted)} attempted, {len(rows)} remaining, {len(all_rows)} total"
             )
         else:
             rows = all_rows
@@ -534,6 +551,7 @@ class ModernArticleScraper:
         con.close()
 
         enriched = []
+        failed_urls = []  # Track failed attempts
 
         # Use async event loop
         async def process_urls():
@@ -554,6 +572,7 @@ class ModernArticleScraper:
                 logger.info(f"[{idx}/{len(rows)}] Fetching: {url[:60]}...")
 
                 article = await self.fetch_article_content(url)
+
                 # Only append successful scrapes (excludes 403, SSL errors, timeouts, etc.)
                 if article and article.get("status") == "success":
                     enriched.append(
@@ -576,21 +595,41 @@ class ModernArticleScraper:
                             "scrape_method": article.get("method"),
                         }
                     )
+                else:
+                    # Track failed attempts (403, SSL, timeout, all_failed, etc.)
+                    failed_urls.append(
+                        {
+                            "url": url,
+                            "status": article.get("status") if article else "unknown",
+                            "error": article.get("error") if article else "no_response",
+                        }
+                    )
 
-                    # Incremental save every 10 successful articles (for resume capability)
-                    if output_file and len(enriched) % 10 == 0:
+                # Incremental save every 10 attempts (successful or failed)
+                total_attempts = len(enriched) + len(failed_urls)
+                if output_file and total_attempts % 10 == 0:
+                    # Save successful articles
+                    if enriched:
                         self._save_incremental(enriched, output_file, append=True)
                         logger.info(f"💾 Progress saved: {len(enriched)} articles scraped so far")
 
-                        # Also update final merged output if events_file provided
-                        if events_file and final_output_file:
-                            try:
-                                self.merge_articles_with_events(
-                                    events_file, str(output_file), str(final_output_file)
-                                )
-                                logger.info(f"🔗 Final merged output updated: {final_output_file}")
-                            except Exception as e:
-                                logger.warning(f"Could not update final merged output: {e}")
+                    # Save failed URLs for resume capability
+                    if failed_urls:
+                        failed_file = Path(output_file).parent / "failed_urls.parquet"
+                        self._save_incremental(failed_urls, str(failed_file), append=True)
+                        logger.info(
+                            f"📝 Failed URLs tracked: {len(failed_urls)} attempts will be skipped on resume"
+                        )
+
+                    # Also update final merged output if events_file provided
+                    if events_file and final_output_file and enriched:
+                        try:
+                            self.merge_articles_with_events(
+                                events_file, str(output_file), str(final_output_file)
+                            )
+                            logger.info(f"🔗 Final merged output updated: {final_output_file}")
+                        except Exception as e:
+                            logger.warning(f"Could not update final merged output: {e}")
 
         # Run async processing
         try:
@@ -604,7 +643,18 @@ class ModernArticleScraper:
         except RuntimeError:
             asyncio.run(process_urls())
 
-        logger.info(f"Successfully enriched {len(enriched)}/{len(rows)} articles")
+        # Final save of any remaining articles and failed URLs
+        if output_file:
+            if enriched:
+                self._save_incremental(enriched, output_file, append=True)
+            if failed_urls:
+                failed_file = Path(output_file).parent / "failed_urls.parquet"
+                self._save_incremental(failed_urls, str(failed_file), append=True)
+                logger.info(f"📝 Saved {len(failed_urls)} failed URLs to skip on future resumes")
+
+        logger.info(
+            f"✅ Successfully scraped {len(enriched)}/{len(rows)} articles ({len(failed_urls)} failed)"
+        )
         return enriched
 
     def _save_incremental(self, articles: list, output_file: Path | str, append: bool = False):

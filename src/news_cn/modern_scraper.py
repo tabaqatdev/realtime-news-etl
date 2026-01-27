@@ -679,13 +679,15 @@ class ModernArticleScraper:
 
         if append and output_file.exists():
             # Append by reading existing + new data, then deduplicating by URL
+            # Order by date if it exists (for articles), otherwise just deduplicate (for failed URLs)
+            order_clause = "ORDER BY date DESC" if "date" in df.columns else ""
             query = f"""
                 SELECT DISTINCT * FROM (
                     SELECT * FROM read_parquet('{output_file}')
                     UNION ALL
                     SELECT * FROM df
                 )
-                ORDER BY date DESC
+                {order_clause}
             """
             con.execute(f"COPY ({query}) TO '{output_file}' (FORMAT PARQUET, COMPRESSION ZSTD)")
         else:

@@ -1,8 +1,10 @@
 # Incremental Final Merge
 
-## ✨ New Feature: Real-Time Access to Complete Dataset
+## ✨ Feature: Real-Time Access to Successfully Scraped Dataset
 
 The pipeline now **updates the final merged output every 10 articles** during scraping, so you can access the complete dataset (geo-enriched + articles + deduplication) even if you stop mid-scraping.
+
+**IMPORTANT**: By default, `final_enriched.parquet` contains **ONLY events with successfully scraped articles** (INNER JOIN). This means you get a clean dataset with 100% enrichment rate, no NULL article fields.
 
 ## How It Works
 
@@ -22,10 +24,10 @@ Scraping: [1/10546] → [2/10546] → ... → [10546/10546]
 Scraping: [1/10546] → ... → [10/10546] ✓ Merge → [20/10546] ✓ Merge → ...
           ↓                    ↓                     ↓
     Articles saved    final_enriched.parquet  final_enriched.parquet
-                           updated                 updated
+                      (10 events w/ articles) (20 events w/ articles)
 ```
 
-**Benefit**: Cancel anytime and `final_enriched.parquet` is always up-to-date.
+**Benefit**: Cancel anytime and `final_enriched.parquet` contains all successfully scraped events (no empty/NULL records).
 
 ## What Gets Updated
 
@@ -33,9 +35,9 @@ Every 10 successfully scraped articles:
 
 1. **Articles saved** → `data/articles/enriched_articles.parquet`
 2. **Final merge triggered** → `data/parquet/cleaned/final_enriched.parquet`
-   - Includes ALL events (deduplicated, geo-enriched)
-   - Includes scraped articles (LEFT JOIN on URL)
-   - Articles that haven't been scraped yet have NULL in article columns
+   - **INNER JOIN** on URL - only events with successfully scraped articles
+   - **100% enrichment rate** - all records have article content
+   - **No NULL fields** - clean, ready-to-use dataset
 
 ## Output Files
 
@@ -47,10 +49,25 @@ Every 10 successfully scraped articles:
 
 ### 2. Final Merged Output ⭐
 `data/parquet/cleaned/final_enriched.parquet`
-- **Always up-to-date** with latest articles
-- Contains ALL events (even those not scraped yet)
-- Schema: GDELT fields + Geo enrichment + Article content
+- **Always up-to-date** with latest successfully scraped articles
+- Contains **ONLY events with article content** (INNER JOIN)
+- **100% enrichment rate** - no empty article fields
+- Schema: GDELT fields + Geo enrichment + Article content (all populated)
 - Updated every 10 articles automatically
+
+## Join Type: INNER JOIN (Default)
+
+```python
+# By default: only_with_articles=True
+merge_articles_with_events(
+    events_parquet='geo_enriched.parquet',
+    articles_parquet='articles_scraped.parquet',
+    output_parquet='final_enriched.parquet',
+    only_with_articles=True  # INNER JOIN - only events with articles
+)
+```
+
+**Result**: If you scraped 166 articles out of 10,546 events, `final_enriched.parquet` contains **166 rows**, not 10,546 rows with 10,380 NULLs.
 
 ## Logs You'll See
 
@@ -60,11 +77,13 @@ Every 10 successfully scraped articles:
 ✓ Trafilatura: https://english.aawsat.com/...
 💾 Progress saved: 10 articles scraped so far
 🔗 Final merged output updated: data/parquet/cleaned/final_enriched.parquet
+✅ Exported 10 events with successfully scraped articles (100% enrichment)
 
 [20/10396] Fetching: https://www.livemint.com/...
 ✓ Trafilatura: https://www.livemint.com/...
 💾 Progress saved: 20 articles scraped so far
 🔗 Final merged output updated: data/parquet/cleaned/final_enriched.parquet
+✅ Exported 20 events with successfully scraped articles (100% enrichment)
 ```
 
 ### If You Cancel Mid-Scraping
@@ -73,7 +92,7 @@ Every 10 successfully scraped articles:
 
 # Files available:
 ✅ data/articles/enriched_articles.parquet (5430 articles)
-✅ data/parquet/cleaned/final_enriched.parquet (4074 events, 5430 with articles)
+✅ data/parquet/cleaned/final_enriched.parquet (5430 events, 100% with articles)
 ```
 
 ## Schema of final_enriched.parquet
@@ -92,14 +111,14 @@ Every 10 successfully scraped articles:
 - Plus city population and country for each
 
 ### Article Content (6 columns)
-- `ArticleTitle` - Scraped article title
-- `ArticleContent` - Full article text
-- `ArticleAuthor` - Author name(s)
-- `ArticlePublishDate` - Publication date
-- `ArticleContentLength` - Character count
+- `ArticleTitle` - Scraped article title (always populated)
+- `ArticleContent` - Full article text (always populated)
+- `ArticleAuthor` - Author name(s) (may be NULL if not found in article)
+- `ArticlePublishDate` - Publication date (may be NULL if not found)
+- `ArticleContentLength` - Character count (always populated)
 - `ArticleScrapeMethod` - Which method succeeded (trafilatura/newspaper4k/playwright)
 
-**Total**: 77+ columns
+**Total**: 77+ columns, **all with data** (except optional author/date fields)
 
 ## Use Cases
 
@@ -110,24 +129,24 @@ uv run news-cn --country SA --scrape-limit 99999
 
 # Terminal 2: Check progress anytime
 duckdb -c "SELECT
-    COUNT(*) as total_events,
-    COUNT(ArticleTitle) as with_articles,
-    ROUND(100.0 * COUNT(ArticleTitle) / COUNT(*), 1) as pct
+    COUNT(*) as total_events_with_articles,
+    AVG(ArticleContentLength) as avg_article_length,
+    COUNT(DISTINCT ArticleScrapeMethod) as methods_used
 FROM 'data/parquet/cleaned/final_enriched.parquet'"
 ```
 
 ### 2. Analyze Partial Results
 Cancel scraping after 1000 articles and start analysis immediately:
 ```sql
--- Works even though scraping was interrupted
+-- All rows have article content (100% enrichment)
 SELECT
     SQLDATE,
     Actor1Name,
     ArticleTitle,
     NearestCity,
-    quality_score
+    quality_score,
+    ArticleContentLength
 FROM 'data/parquet/cleaned/final_enriched.parquet'
-WHERE ArticleTitle IS NOT NULL
 ORDER BY SQLDATE DESC
 LIMIT 10;
 ```
@@ -138,7 +157,7 @@ LIMIT 10;
 uv run news-cn --country SA --scrape-limit 99999
 ^C
 
-# Analyze partial data immediately
+# Analyze partial data immediately (3000 complete records)
 duckdb 'data/parquet/cleaned/final_enriched.parquet'
 
 # Day 2: Continue scraping
@@ -150,6 +169,7 @@ uv run news-cn --country SA --scrape-limit 99999
 
 ### Merge Logic (DuckDB)
 ```sql
+-- INNER JOIN: only events with successfully scraped articles
 SELECT
     e.*,  -- All event fields
     a.title as ArticleTitle,
@@ -159,9 +179,15 @@ SELECT
     a.content_length as ArticleContentLength,
     a.scrape_method as ArticleScrapeMethod
 FROM read_parquet('geo_enriched.parquet') e
-LEFT JOIN read_parquet('enriched_articles.parquet') a
+INNER JOIN read_parquet('enriched_articles.parquet') a
     ON e.SOURCEURL = a.url
 ```
+
+**Why INNER JOIN?**
+- You only want events you successfully scraped
+- No point including events with NULL article fields
+- Clean dataset, 100% enrichment rate
+- Smaller file size (only useful records)
 
 ### Incremental Trigger
 ```python
@@ -170,11 +196,12 @@ if len(enriched) % 10 == 0:
     # Save articles
     _save_incremental(enriched, articles_file)
 
-    # Update final merge
+    # Update final merge (INNER JOIN by default)
     merge_articles_with_events(
         events_file,
         articles_file,
-        final_output_file
+        final_output_file,
+        only_with_articles=True  # INNER JOIN
     )
 ```
 
@@ -185,12 +212,14 @@ if len(enriched) % 10 == 0:
 
 ## Benefits Summary
 
-✅ **Always have access** to complete dataset
+✅ **Clean dataset** - 100% enrichment rate, no NULL article fields
+✅ **Always have access** to successfully scraped events
 ✅ **Cancel anytime** without losing merged output
 ✅ **Monitor progress** in real-time
 ✅ **Start analysis** before scraping completes
 ✅ **Resume-friendly** - works perfectly with resume feature
 ✅ **Minimal overhead** - only 1-2 seconds every 10 articles
+✅ **Smaller files** - only useful records, no empty rows
 
 ---
 
@@ -202,25 +231,41 @@ uv run news-cn --country SA --scrape-limit 99999
 
 # After 500 articles (5 updates):
 # - enriched_articles.parquet has 500 articles
-# - final_enriched.parquet has 4074 events (500 with articles, 3574 without)
+# - final_enriched.parquet has 500 events (100% with articles)
 
 # Cancel and analyze
 ^C
 
-# Query immediately
+# Query immediately (all rows have articles)
 duckdb -c "
 SELECT
-    COUNT(*) as total,
-    COUNT(ArticleTitle) as scraped,
-    COUNT(*) - COUNT(ArticleTitle) as remaining
+    COUNT(*) as total_events_with_articles,
+    MIN(ArticleContentLength) as shortest,
+    MAX(ArticleContentLength) as longest,
+    AVG(ArticleContentLength) as avg_length
 FROM 'data/parquet/cleaned/final_enriched.parquet'
 "
-# Output: 4074 total, 500 scraped, 3574 remaining
+# Output: 500 total, all with article content
 
 # Resume later
 uv run news-cn --country SA --scrape-limit 99999
 # Continues from 500, skips already-scraped URLs
-# final_enriched.parquet keeps getting updated
+# final_enriched.parquet keeps growing with new successfully scraped events
 ```
 
 Perfect for long-running scraping jobs! 🚀
+
+## Advanced: Include All Events (LEFT JOIN)
+
+If you want the old behavior (all events, even without articles), you can set `only_with_articles=False`:
+
+```python
+merge_articles_with_events(
+    events_parquet='geo_enriched.parquet',
+    articles_parquet='articles_scraped.parquet',
+    output_parquet='final_enriched_all.parquet',
+    only_with_articles=False  # LEFT JOIN - includes events without articles
+)
+```
+
+This creates a larger file with NULL values in article columns for events that haven't been scraped yet. Most users won't need this.

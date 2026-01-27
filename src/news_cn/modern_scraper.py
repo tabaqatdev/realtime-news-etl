@@ -396,7 +396,11 @@ class ModernArticleScraper:
         return {"url": url, "status": "all_failed"}
 
     def merge_articles_with_events(
-        self, events_parquet: str, articles_parquet: str, output_parquet: str
+        self,
+        events_parquet: str,
+        articles_parquet: str,
+        output_parquet: str,
+        only_with_articles: bool = True,
     ):
         """
         Merge scraped articles back into the geo-enriched events parquet
@@ -405,10 +409,15 @@ class ModernArticleScraper:
             events_parquet: Path to geo-enriched events parquet
             articles_parquet: Path to scraped articles parquet
             output_parquet: Path for final merged output
+            only_with_articles: If True (default), only include events with successfully scraped articles.
+                               If False, include all events with NULL for missing articles.
         """
         con = duckdb.connect(":memory:")
 
-        # Left join events with articles on SOURCEURL
+        # Use INNER JOIN to only keep events with articles (default)
+        # or LEFT JOIN to keep all events even without articles
+        join_type = "INNER" if only_with_articles else "LEFT"
+
         query = f"""
             SELECT
                 e.*,
@@ -419,7 +428,7 @@ class ModernArticleScraper:
                 a.content_length as ArticleContentLength,
                 a.scrape_method as ArticleScrapeMethod
             FROM read_parquet('{events_parquet}') e
-            LEFT JOIN read_parquet('{articles_parquet}') a
+            {join_type} JOIN read_parquet('{articles_parquet}') a
                 ON e.SOURCEURL = a.url
         """
 
@@ -437,9 +446,14 @@ class ModernArticleScraper:
 
         con.close()
 
-        logger.info(
-            f"✅ Merged events with articles: {stats[1]:,}/{stats[0]:,} ({stats[2]}%) have article content"
-        )
+        if only_with_articles:
+            logger.info(
+                f"✅ Exported {stats[0]:,} events with successfully scraped articles (100% enrichment)"
+            )
+        else:
+            logger.info(
+                f"✅ Merged events with articles: {stats[1]:,}/{stats[0]:,} ({stats[2]}%) have article content"
+            )
         logger.info(f"📁 Final output: {output_parquet}")
 
         return {

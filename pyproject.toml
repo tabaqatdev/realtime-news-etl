@@ -4,7 +4,7 @@ version = "0.3.0"
 description = "GDELT news data pipeline - daily processing with S3 export"
 readme = "README.md"
 requires-python = ">=3.12"
-authors = [{ name = "Tabaqat", email = "dev@tabaqat.dev" }]
+authors = [{ name = "Youssef Harby", email = "me@youssefharby.com" }]
 keywords = ["gdelt", "news", "data-pipeline", "saudi-arabia", "duckdb"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -25,6 +25,11 @@ dependencies = [
     "requests>=2.32.0",
     "trafilatura>=2.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/tabaqatdev/gdelt-cng"
+Repository = "https://github.com/tabaqatdev/gdelt-cng"
+Issues = "https://github.com/tabaqatdev/gdelt-cng/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0.0", "ruff>=0.1.0", "mypy>=1.0.0"]

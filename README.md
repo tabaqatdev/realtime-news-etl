@@ -127,10 +127,8 @@ The workflow at `.github/workflows/daily-pipeline.yml` runs the pipeline daily a
    - `AWS_DEFAULT_REGION`
 
 2. Add repository variables:
-   - `S3_BUCKET` — bucket name
-   - `S3_PREFIX` — key prefix (e.g. `gdelt/news`)
-
-3. The workflow uses Source Cooperative S3 endpoint (`https://us-west-2.opendata.source.coop`).
+   - `S3_BUCKET` — bucket name (e.g. `us-west-2.opendata.source.coop`)
+   - `S3_PREFIX` — key prefix (e.g. `tabaqat/gdelt-sa`)
 
 ### Usage
 

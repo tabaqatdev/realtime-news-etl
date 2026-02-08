@@ -400,7 +400,7 @@ class ModernArticleScraper:
         events_parquet: str,
         articles_parquet: str,
         output_parquet: str,
-        only_with_articles: bool = True,
+        only_with_articles: bool = False,
     ):
         """
         Merge scraped articles back into the geo-enriched events parquet
@@ -409,13 +409,13 @@ class ModernArticleScraper:
             events_parquet: Path to geo-enriched events parquet
             articles_parquet: Path to scraped articles parquet
             output_parquet: Path for final merged output
-            only_with_articles: If True (default), only include events with successfully scraped articles.
-                               If False, include all events with NULL for missing articles.
+            only_with_articles: If True, only include events with successfully scraped articles.
+                               If False (default), include all events with NULL for missing articles.
         """
         con = duckdb.connect(":memory:")
 
-        # Use INNER JOIN to only keep events with articles (default)
-        # or LEFT JOIN to keep all events even without articles
+        # Use INNER JOIN to only keep events with articles
+        # or LEFT JOIN to keep all events even without articles (default)
         join_type = "INNER" if only_with_articles else "LEFT"
 
         query = f"""
@@ -428,8 +428,11 @@ class ModernArticleScraper:
                 a.content_length as ArticleContentLength,
                 a.scrape_method as ArticleScrapeMethod
             FROM read_parquet('{events_parquet}') e
-            {join_type} JOIN read_parquet('{articles_parquet}') a
-                ON e.SOURCEURL = a.url
+            {join_type} JOIN (
+                SELECT DISTINCT ON (url) *
+                FROM read_parquet('{articles_parquet}')
+                ORDER BY url, content_length DESC
+            ) a ON e.SOURCEURL = a.url
         """
 
         # Export directly to parquet
@@ -516,22 +519,20 @@ class ModernArticleScraper:
             )
 
         # Get unique URLs from events
+        # Use events_file (deduplicated/geo-enriched) if available, otherwise fall back to raw parquet
+        source = events_file if events_file and Path(events_file).exists() else parquet_pattern
         query = f"""
-            SELECT DISTINCT
-                SOURCEURL,
-                SQLDATE,
-                Actor1Name,
-                Actor1CountryCode,
-                Actor2Name,
-                Actor2CountryCode,
-                ActionGeo_FullName,
-                ActionGeo_CountryCode,
-                AvgTone,
-                EventCode
-            FROM read_parquet('{parquet_pattern}')
-            WHERE SOURCEURL IS NOT NULL
-                AND SOURCEURL != ''
-                AND ActionGeo_CountryCode = 'SA'  -- Saudi Arabia events only
+            SELECT SOURCEURL, SQLDATE, Actor1Name, Actor1CountryCode,
+                   Actor2Name, Actor2CountryCode, ActionGeo_FullName,
+                   ActionGeo_CountryCode, AvgTone, EventCode
+            FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY SOURCEURL ORDER BY SQLDATE DESC
+                ) as rn
+                FROM read_parquet('{source}')
+                WHERE SOURCEURL IS NOT NULL AND SOURCEURL != ''
+            )
+            WHERE rn = 1
             ORDER BY SQLDATE DESC
             LIMIT {limit}
         """
@@ -679,16 +680,27 @@ class ModernArticleScraper:
 
         if append and output_file.exists():
             # Append by reading existing + new data, then deduplicating by URL
-            # Order by date if it exists (for articles), otherwise just deduplicate (for failed URLs)
-            order_clause = "ORDER BY date DESC" if "date" in df.columns else ""
-            query = f"""
-                SELECT DISTINCT * FROM (
-                    SELECT * FROM read_parquet('{output_file}')
-                    UNION ALL
-                    SELECT * FROM df
-                )
-                {order_clause}
-            """
+            # Keep the best version per URL (longest content for articles, latest for failed URLs)
+            if "content_length" in df.columns:
+                # Articles: keep longest content per URL
+                query = f"""
+                    SELECT DISTINCT ON (url) * FROM (
+                        SELECT * FROM read_parquet('{output_file}')
+                        UNION ALL
+                        SELECT * FROM df
+                    )
+                    ORDER BY url, content_length DESC
+                """
+            else:
+                # Failed URLs: just deduplicate by URL
+                query = f"""
+                    SELECT DISTINCT ON (url) * FROM (
+                        SELECT * FROM read_parquet('{output_file}')
+                        UNION ALL
+                        SELECT * FROM df
+                    )
+                    ORDER BY url
+                """
             con.execute(f"COPY ({query}) TO '{output_file}' (FORMAT PARQUET, COMPRESSION ZSTD)")
         else:
             # Fresh write

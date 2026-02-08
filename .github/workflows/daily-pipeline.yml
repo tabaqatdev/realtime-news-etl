@@ -1,0 +1,88 @@
+name: Daily GDELT Pipeline
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Midnight UTC daily
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start date (YYYY-MM-DD). For backfill from a specific date.'
+        required: false
+      end_date:
+        description: 'End date (YYYY-MM-DD). Defaults to yesterday.'
+        required: false
+      scrape_limit:
+        description: 'Max articles to scrape per day'
+        default: '500'
+      country:
+        description: 'Country code (default: SA)'
+        default: 'SA'
+
+env:
+  S3_ENDPOINT: 'https://us-west-2.opendata.source.coop'
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - run: uv python install 3.12
+      - run: uv sync
+      - run: uv run playwright install chromium --with-deps
+
+      - name: Compute dates
+        id: dates
+        run: |
+          if [ -n "${{ inputs.start_date }}" ]; then
+            START="${{ inputs.start_date }}"
+          else
+            START=$(date -u -d "yesterday" +%Y-%m-%d)
+          fi
+
+          if [ -n "${{ inputs.end_date }}" ]; then
+            END="${{ inputs.end_date }}"
+          else
+            END=$(date -u -d "yesterday" +%Y-%m-%d)
+          fi
+
+          COUNTRY="${{ inputs.country || 'SA' }}"
+
+          echo "start=$START" >> "$GITHUB_OUTPUT"
+          echo "end=$END" >> "$GITHUB_OUTPUT"
+          echo "country=$COUNTRY" >> "$GITHUB_OUTPUT"
+          echo "Processing $COUNTRY from $START to $END"
+
+      - name: Run pipeline
+        run: |
+          uv run news-cn \
+            --country ${{ steps.dates.outputs.country }} \
+            --start-date ${{ steps.dates.outputs.start }} \
+            --end-date ${{ steps.dates.outputs.end }} \
+            --scrape-limit ${{ inputs.scrape_limit || '500' }} \
+            --mode daily
+
+      - name: Upload daily files to S3
+        if: vars.S3_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+        run: |
+          aws s3 sync \
+            data/output/ \
+            s3://${{ vars.S3_BUCKET }}/${{ vars.S3_PREFIX }}/ \
+            --endpoint-url "$S3_ENDPOINT" \
+            --size-only
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pipeline-${{ steps.dates.outputs.country }}-${{ steps.dates.outputs.start }}-to-${{ steps.dates.outputs.end }}
+          path: data/output/
+          retention-days: 7

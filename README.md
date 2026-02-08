@@ -1,5 +1,6 @@
 # GDELT News Pipeline
 
+[![Daily GDELT Pipeline](https://github.com/tabaqatdev/gdelt-cng/actions/workflows/daily-pipeline.yml/badge.svg)](https://github.com/tabaqatdev/gdelt-cng/actions/workflows/daily-pipeline.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![DuckDB](https://img.shields.io/badge/duckdb-1.4+-yellow.svg)](https://duckdb.org/)
 
@@ -156,14 +157,14 @@ uv run pytest                # Test
 
 Each daily Parquet file contains [GDELT 2.0 Event fields](http://data.gdeltproject.org/documentation/GDELT-Event_Codebook-V2.0.pdf) plus:
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `ArticleTitle` | VARCHAR | Scraped article title |
-| `ArticleContent` | VARCHAR | Full article text |
-| `ArticleAuthor` | VARCHAR | Article author |
-| `ArticlePublishDate` | VARCHAR | Publication date |
-| `ArticleContentLength` | BIGINT | Content length in chars |
-| `ArticleScrapeMethod` | VARCHAR | Method used (trafilatura/newspaper4k/playwright) |
+| Field                  | Type    | Description                                      |
+| ---------------------- | ------- | ------------------------------------------------ |
+| `ArticleTitle`         | VARCHAR | Scraped article title                            |
+| `ArticleContent`       | VARCHAR | Full article text                                |
+| `ArticleAuthor`        | VARCHAR | Article author                                   |
+| `ArticlePublishDate`   | VARCHAR | Publication date                                 |
+| `ArticleContentLength` | BIGINT  | Content length in chars                          |
+| `ArticleScrapeMethod`  | VARCHAR | Method used (trafilatura/newspaper4k/playwright) |
 
 Key GDELT fields: `GLOBALEVENTID`, `SQLDATE`, `Actor1Name`, `Actor2Name`, `EventCode`, `GoldsteinScale`, `AvgTone`, `ActionGeo_FullName`, `SOURCEURL`.
 

@@ -2,21 +2,21 @@ name: Daily GDELT Pipeline
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Midnight UTC daily
+    - cron: "20 0 * * *" # 00:20 UTC daily
   workflow_dispatch:
     inputs:
       start_date:
-        description: 'Start date (YYYY-MM-DD). For backfill from a specific date.'
+        description: "Start date (YYYY-MM-DD). For backfill from a specific date."
         required: false
       end_date:
-        description: 'End date (YYYY-MM-DD). Defaults to yesterday.'
+        description: "End date (YYYY-MM-DD). Defaults to yesterday."
         required: false
       scrape_limit:
-        description: 'Max articles to scrape per day'
-        default: '500'
+        description: "Max articles to scrape per day"
+        default: "500"
       country:
-        description: 'Country code (default: SA)'
-        default: 'SA'
+        description: "Country code (default: SA)"
+        default: "SA"
 
 jobs:
   pipeline:

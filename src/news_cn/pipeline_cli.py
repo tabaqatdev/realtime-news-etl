@@ -1,11 +1,17 @@
 """
 Unified Pipeline CLI - Run complete GDELT pipeline with one command
 Orchestrates: Download → Process → Clean → Scrape → Analyze
+
+Modes:
+  --mode full   : Process all days into one combined file (legacy)
+  --mode daily  : Per-day output files with gap-filling (recommended)
 """
 
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+
+import duckdb
 
 from .data_cleaner import clean_events_data, validate_data_quality
 from .deduplicator import SmartDeduplicator
@@ -23,11 +29,13 @@ class UnifiedPipeline:
         self,
         country: str = "SA",
         start_date: str = "2026-01-01",
+        end_date: str | None = None,
         output_dir: str = "data",
         strategy: str = "batch",
     ):
         self.country = country
         self.start_date = start_date
+        self.end_date = end_date
         self.output_dir = Path(output_dir)
         self.strategy = strategy
 
@@ -36,20 +44,241 @@ class UnifiedPipeline:
         self.articles_dir = self.output_dir / "articles"
         self.cleaned_dir = self.output_dir / "parquet" / "cleaned"
 
-    def print_banner(self):
-        """Print pipeline banner"""
+    def print_banner(self, mode: str = "full"):
+        end_display = self.end_date or "today"
         banner = f"""
 ╔══════════════════════════════════════════════════════════════════════╗
-║             GDELT UNIFIED PIPELINE - All-in-One                      ║
+║             GDELT UNIFIED PIPELINE - {mode.upper():^10}                      ║
 ║  Collect → Process → Clean → Dedupe → Geo → Scrape → Analyze        ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
 📍 Country: {self.country}
-📅 Start Date: {self.start_date}
+📅 Date Range: {self.start_date} → {end_display}
 📁 Output: {self.output_dir}
 ⚡ Strategy: {self.strategy}
 """
         print(banner)
+
+    # ─── Daily Mode (per-day output files) ────────────────────────
+
+    def run_daily_pipeline(self, scrape_limit: int = 500):
+        """
+        Process each day independently into separate parquet files.
+        Skips days that already have output files (idempotent gap-filling).
+
+        Output structure:
+          data/output/country=SA/year=2026/2026_01_15.parquet
+        """
+        self.print_banner(mode="daily")
+        start_time = datetime.now()
+
+        # 1. Determine date range
+        start = datetime.strptime(self.start_date, "%Y-%m-%d").date()
+        end = (
+            datetime.strptime(self.end_date, "%Y-%m-%d").date()
+            if self.end_date
+            else date.today() - timedelta(days=1)
+        )
+
+        # 2. Output directory
+        output_base = self.output_dir / "output" / f"country={self.country}"
+
+        # 3. Find which days already have output
+        existing = set()
+        if output_base.exists():
+            for f in output_base.rglob("*.parquet"):
+                existing.add(f.stem)  # "2026_01_15"
+
+        # 4. Build list of missing days
+        all_days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+        missing = [d for d in all_days if d.strftime("%Y_%m_%d") not in existing]
+
+        if not missing:
+            print(f"✅ All {len(all_days)} days already processed!")
+            return
+
+        print(f"📊 Total days in range: {len(all_days)}")
+        print(f"✅ Already processed: {len(existing)}")
+        print(f"🔄 Missing (to process): {len(missing)}")
+
+        # 5. Collect GDELT data for the missing date range
+        collect_start = min(missing).strftime("%Y-%m-%d")
+        collect_end = max(missing).strftime("%Y-%m-%d")
+
+        print("\n" + "=" * 70)
+        print("STEP 1: COLLECTING GDELT DATA")
+        print("=" * 70)
+
+        collect_news(
+            country=self.country,
+            start_date=collect_start,
+            end_date=collect_end,
+            output_dir=str(self.parquet_dir),
+            strategy=self.strategy,
+        )
+
+        # 6. Process each missing day
+        processed = 0
+        for idx, day in enumerate(missing, 1):
+            print(f"\n{'=' * 70}")
+            print(f"[Day {idx}/{len(missing)}] Processing {day.isoformat()}")
+            print("=" * 70)
+
+            try:
+                output_file = self._process_single_day(day, output_base, scrape_limit)
+                if output_file:
+                    processed += 1
+                    print(f"  ✅ → {output_file}")
+            except Exception as e:
+                logger.error(f"  ✗ Failed to process {day}: {e}")
+                continue
+
+        # Summary
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print(f"\n{'=' * 70}")
+        print("🎉 DAILY PIPELINE COMPLETE")
+        print("=" * 70)
+        print(f"⏱️  Time elapsed: {elapsed:.1f} seconds")
+        print(f"📊 Days processed: {processed}/{len(missing)}")
+        print(f"📁 Output: {output_base}/")
+        print("=" * 70)
+
+    def _process_single_day(self, day: date, output_base: Path, scrape_limit: int) -> Path | None:
+        """
+        Full pipeline for one day:
+        raw parquet → clean → dedupe → geo-enrich → scrape → merge → daily output file
+        """
+        date_str = day.strftime("%Y%m%d")
+        day_num = f"{day.day:02d}"
+        month_num = f"{day.month:02d}"
+
+        # Find this day's consolidated parquet
+        day_pattern = str(
+            self.parquet_dir
+            / "events"
+            / f"year={day.year}"
+            / f"month={month_num}"
+            / f"day={day_num}"
+            / "*.parquet"
+        )
+
+        con = duckdb.connect(":memory:")
+        try:
+            count = con.execute(f"SELECT count(*) FROM read_parquet('{day_pattern}')").fetchone()[0]
+        except Exception:
+            logger.warning(f"  No raw data found for {day.isoformat()}")
+            con.close()
+            return None
+
+        if count == 0:
+            logger.warning(f"  No records for {day.isoformat()}")
+            con.close()
+            return None
+
+        print(f"  📊 Raw records: {count:,}")
+
+        # Use temp dir for intermediate files
+        tmp = self.output_dir / "tmp" / date_str
+        tmp.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Step 1: Clean
+            cleaned_file = tmp / "cleaned.parquet"
+            con.execute(f"""
+                COPY (
+                    SELECT DISTINCT *
+                    FROM read_parquet('{day_pattern}')
+                    WHERE GLOBALEVENTID IS NOT NULL
+                      AND SQLDATE IS NOT NULL
+                      AND SOURCEURL IS NOT NULL AND SOURCEURL != ''
+                      AND AvgTone BETWEEN -10.0 AND 10.0
+                    ORDER BY SQLDATE DESC, DATEADDED DESC
+                ) TO '{cleaned_file}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """)
+            cleaned_count = con.execute(
+                f"SELECT count(*) FROM read_parquet('{cleaned_file}')"
+            ).fetchone()[0]
+            print(f"  🧹 Cleaned: {cleaned_count:,}")
+
+            # Step 2: Deduplicate (best record per URL)
+            deduped_file = tmp / "deduped.parquet"
+            deduplicator = SmartDeduplicator()
+            try:
+                deduplicator.deduplicate_by_url(str(cleaned_file), str(deduped_file))
+                deduped_count = con.execute(
+                    f"SELECT count(*) FROM read_parquet('{deduped_file}')"
+                ).fetchone()[0]
+                print(f"  🔍 Deduplicated: {deduped_count:,} unique URLs")
+            finally:
+                deduplicator.close()
+
+            # Step 3: Geo-enrich
+            geo_file = tmp / "geo.parquet"
+            corrector = GeoCorrector()
+            try:
+                corrector.enrich_with_reference_data(str(deduped_file), str(geo_file))
+                print("  🌍 Geo-enriched")
+            except Exception as e:
+                logger.warning(f"  ⚠️  Geo-enrichment failed: {e}, using deduped file")
+                geo_file = deduped_file
+            finally:
+                corrector.close()
+
+            # Step 4: Scrape articles
+            articles_file = tmp / "articles.parquet"
+            scraper = ModernArticleScraper()
+            scraper.enrich_events_with_content(
+                parquet_pattern=str(geo_file),
+                limit=scrape_limit,
+                output_file=articles_file,
+                events_file=str(geo_file),
+                final_output_file=None,  # We'll merge ourselves
+            )
+
+            # Step 5: Merge events + articles (LEFT JOIN)
+            year_dir = output_base / f"year={day.year}"
+            year_dir.mkdir(parents=True, exist_ok=True)
+            output_file = year_dir / f"{day.strftime('%Y_%m_%d')}.parquet"
+
+            if articles_file.exists():
+                scraper.merge_articles_with_events(
+                    events_parquet=str(geo_file),
+                    articles_parquet=str(articles_file),
+                    output_parquet=str(output_file),
+                    only_with_articles=False,
+                )
+            else:
+                # No articles scraped — copy geo-enriched as final output with NULL article cols
+                con.execute(f"""
+                    COPY (
+                        SELECT *,
+                            NULL::VARCHAR as ArticleTitle,
+                            NULL::VARCHAR as ArticleContent,
+                            NULL::VARCHAR as ArticleAuthor,
+                            NULL::VARCHAR as ArticlePublishDate,
+                            NULL::BIGINT as ArticleContentLength,
+                            NULL::VARCHAR as ArticleScrapeMethod
+                        FROM read_parquet('{geo_file}')
+                    ) TO '{output_file}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                """)
+
+            # Verify
+            stats = con.execute(f"""
+                SELECT count(*) as total, count(ArticleTitle) as with_articles
+                FROM read_parquet('{output_file}')
+            """).fetchone()
+            print(f"  📰 Final: {stats[0]:,} events, {stats[1]:,} with articles")
+
+            return output_file
+
+        finally:
+            con.close()
+            # Clean up temp files
+            import shutil
+
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ─── Full Mode (legacy: one combined file) ────────────────────
 
     def step_1_collect(self) -> dict:
         """Step 1: Collect GDELT data"""
@@ -60,6 +289,7 @@ class UnifiedPipeline:
         results = collect_news(
             country=self.country,
             start_date=self.start_date,
+            end_date=self.end_date,
             output_dir=str(self.parquet_dir),
             strategy=self.strategy,
         )
@@ -95,7 +325,6 @@ class UnifiedPipeline:
 
         print(f"✅ Cleaned {stats['records_after']:,} records")
 
-        # Smart deduplication by URL (keep best record per URL)
         if deduplicate:
             print("\n🔍 Smart deduplication: Selecting best record per unique URL...")
             deduplicator = SmartDeduplicator()
@@ -113,7 +342,6 @@ class UnifiedPipeline:
                 stats["after_deduplication"] = dedup_stats["records_after"]
                 stats["avg_quality_score"] = dedup_stats["avg_quality_score"]
 
-                # Use deduplicated file for downstream processing
                 working_file = dedup_output
             except Exception as e:
                 logger.warning(f"⚠️  Deduplication failed: {e}")
@@ -123,16 +351,12 @@ class UnifiedPipeline:
         else:
             working_file = str(self.cleaned_dir / "cleaned_events.parquet")
 
-        # Optional geo-enrichment
         if enrich_geo:
             print("\n🌍 Enriching with geographic data (all coordinate sets)...")
             corrector = GeoCorrector()
             try:
                 geo_output = str(self.cleaned_dir / "geo_enriched.parquet")
-                geo_stats = corrector.enrich_with_reference_data(
-                    working_file,
-                    geo_output,
-                )
+                geo_stats = corrector.enrich_with_reference_data(working_file, geo_output)
                 print(
                     f"✅ Geo-enriched: ActionGeo {geo_stats['action_geo']['enrichment_rate']}%, "
                     f"Actor1Geo {geo_stats['actor1_geo']['enrichment_rate']}%, "
@@ -151,7 +375,7 @@ class UnifiedPipeline:
     def step_4_scrape(
         self, limit: int = 50, enrich_geo: bool = False, deduplicate: bool = True
     ) -> dict:
-        """Step 4: Scrape article content and merge with events (optional)"""
+        """Step 4: Scrape article content and merge with events"""
         print("\n" + "=" * 70)
         print(f"STEP 4/6: SCRAPING ARTICLES (limit: {limit})")
         print("=" * 70)
@@ -160,7 +384,6 @@ class UnifiedPipeline:
             scraper = ModernArticleScraper()
             articles_file = self.articles_dir / "enriched_articles.parquet"
 
-            # Determine which events file to use for merging
             if deduplicate and (self.cleaned_dir / "deduplicated_events.parquet").exists():
                 base_file = str(self.cleaned_dir / "deduplicated_events.parquet")
             else:
@@ -173,35 +396,27 @@ class UnifiedPipeline:
 
             final_output = self.cleaned_dir / "final_enriched.parquet"
 
-            # Enable resume by passing output_file + incremental merge
             articles = scraper.enrich_events_with_content(
                 parquet_pattern=str(self.parquet_dir / "events/**/*.parquet"),
                 limit=limit,
-                output_file=articles_file,  # Enable resume capability
-                events_file=events_file,  # For incremental merge
-                final_output_file=final_output,  # Final merged output
+                output_file=articles_file,
+                events_file=events_file,
+                final_output_file=final_output,
             )
 
-            # Save scraped articles to Parquet (final save)
-            articles_scraped = 0
-            if articles:
-                scraper.save_enriched_articles(articles, articles_file)
-                articles_scraped = len(articles)
+            articles_scraped = len(articles) if articles else 0
 
-                # Get total count including previously scraped
-                import duckdb
-
+            if articles_file.exists():
                 con = duckdb.connect(":memory:")
                 total_count = con.execute(
-                    f"SELECT COUNT(*) FROM read_parquet('{articles_file}')"
+                    f"SELECT COUNT(DISTINCT url) FROM read_parquet('{articles_file}')"
                 ).fetchone()[0]
                 con.close()
 
                 print(f"✅ Scraped {articles_scraped} new articles → {articles_file}")
-                print(f"📊 Total articles in database: {total_count}")
+                print(f"📊 Total unique articles in database: {total_count}")
 
-                # Final merge (already done incrementally, this is just a final update)
-                print("\n🔗 Final merge with geo-enriched events...")
+                print("\n🔗 Final merge with events...")
                 merge_stats = scraper.merge_articles_with_events(
                     events_parquet=events_file,
                     articles_parquet=str(articles_file),
@@ -209,7 +424,8 @@ class UnifiedPipeline:
                 )
 
                 print(
-                    f"✅ Final enriched dataset: {merge_stats['events_with_articles']:,}/{merge_stats['total_events']:,} "
+                    f"✅ Final enriched dataset: {merge_stats['events_with_articles']:,}"
+                    f"/{merge_stats['total_events']:,} "
                     f"events ({merge_stats['enrichment_rate']}%) have article content"
                 )
                 print(f"📁 {final_output}")
@@ -221,7 +437,6 @@ class UnifiedPipeline:
 
         except Exception as e:
             logger.warning(f"⚠️  Scraping failed: {e}")
-            logger.info("Continuing without article content...")
             import traceback
 
             logger.debug(traceback.format_exc())
@@ -258,31 +473,23 @@ class UnifiedPipeline:
         enrich_geo: bool = False,
         deduplicate: bool = True,
     ):
-        """Run the complete pipeline"""
-        self.print_banner()
+        """Run the complete pipeline (full mode: one combined output file)"""
+        self.print_banner(mode="full")
 
         start_time = datetime.now()
 
-        # Step 1: Collect
         results = self.step_1_collect()
-
-        # Step 2: Validate
         metrics = self.step_2_validate()
-
-        # Step 3: Clean + Deduplicate + Geo-enrich
         stats = self.step_3_clean(enrich_geo=enrich_geo, deduplicate=deduplicate)
 
-        # Step 4: Scrape (optional)
         merge_stats = {"total_events": 0, "events_with_articles": 0, "enrichment_rate": 0.0}
         if scrape_articles:
             merge_stats = self.step_4_scrape(
                 limit=scrape_limit, enrich_geo=enrich_geo, deduplicate=deduplicate
             )
 
-        # Step 5: Analyze
         self.step_5_analyze()
 
-        # Final summary
         elapsed = (datetime.now() - start_time).total_seconds()
 
         print("\n" + "=" * 70)
@@ -305,59 +512,46 @@ class UnifiedPipeline:
             print(f"📄 Final enriched dataset: {self.cleaned_dir}/final_enriched.parquet")
         print("=" * 70)
 
-        return {
-            "days_collected": len(results),
-            "records_cleaned": stats["records_after"],
-            "articles_scraped": merge_stats["events_with_articles"],
-            "article_enrichment_rate": merge_stats["enrichment_rate"],
-            "quality_score": metrics["quality_score"],
-            "elapsed_seconds": elapsed,
-        }
-
 
 def main():
     """CLI entry point"""
     import argparse
 
-    # Smart default: Always start from 2026-01-01 to collect all available data
     default_start = "2026-01-01"
 
     parser = argparse.ArgumentParser(
-        description="Run unified GDELT pipeline - collect, clean, dedupe, geo-enrich, scrape, analyze",
+        description="GDELT news pipeline - collect, clean, dedupe, geo-enrich, scrape, analyze",
         epilog="""
 Examples:
-  # Full pipeline with all defaults (geo-enrichment + deduplication enabled)
-  news-cn --country SA
+  # Daily mode: process yesterday (default for CI/cron)
+  news-cn --mode daily
 
-  # Scrape unlimited articles (will take ~2-3 hours for 4000+ URLs)
-  news-cn --country SA --scrape-limit 99999
+  # Daily mode: backfill from Jan 1 to Feb 7
+  news-cn --mode daily --start-date 2026-01-01 --end-date 2026-02-07
+
+  # Daily mode: process a single specific day
+  news-cn --mode daily --start-date 2026-02-07 --end-date 2026-02-07
+
+  # Full mode (legacy): all data into one file
+  news-cn --mode full --scrape-limit 99999
 
   # Quick run without scraping
-  news-cn --country SA --no-scrape
-
-  # Disable geo-enrichment and deduplication (faster but less quality)
-  news-cn --country SA --no-geo --no-dedupe
-
-  # Custom date range
-  news-cn --country SA --start-date 2026-01-15
+  news-cn --mode full --no-scrape
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--country",
-        default="SA",
-        help="Country code (default: SA)",
-    )
+    parser.add_argument("--country", default="SA", help="Country code (default: SA)")
     parser.add_argument(
         "--start-date",
         default=default_start,
-        help=f"Start date YYYY-MM-DD (default: {default_start} - automatically set to 2026-01-01 or today)",
+        help=f"Start date YYYY-MM-DD (default: {default_start})",
     )
     parser.add_argument(
-        "--output-dir",
-        default="data",
-        help="Output directory (default: data)",
+        "--end-date",
+        default=None,
+        help="End date YYYY-MM-DD (inclusive). In daily mode defaults to yesterday.",
     )
+    parser.add_argument("--output-dir", default="data", help="Output directory (default: data)")
     parser.add_argument(
         "--strategy",
         choices=["batch", "streaming"],
@@ -365,46 +559,42 @@ Examples:
         help="Processing strategy (default: batch)",
     )
     parser.add_argument(
-        "--no-scrape",
-        action="store_true",
-        help="Skip article scraping step",
+        "--mode",
+        choices=["full", "daily"],
+        default="daily",
+        help="Pipeline mode: 'daily' (per-day files, recommended) or 'full' (one combined file)",
     )
+    parser.add_argument("--no-scrape", action="store_true", help="Skip article scraping step")
     parser.add_argument(
         "--scrape-limit",
         type=int,
-        default=50,
-        help="Max articles to scrape (default: 50, use 99999 for unlimited)",
+        default=500,
+        help="Max articles to scrape per day (default: 500)",
     )
-    parser.add_argument(
-        "--no-geo",
-        action="store_true",
-        help="Disable geographic enrichment (enabled by default)",
-    )
-    parser.add_argument(
-        "--no-dedupe",
-        action="store_true",
-        help="Disable smart deduplication (enabled by default)",
-    )
+    parser.add_argument("--no-geo", action="store_true", help="Disable geographic enrichment")
+    parser.add_argument("--no-dedupe", action="store_true", help="Disable smart deduplication")
 
     args = parser.parse_args()
 
-    # Setup logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-    # Run pipeline with smart defaults
     pipeline = UnifiedPipeline(
         country=args.country,
         start_date=args.start_date,
+        end_date=args.end_date,
         output_dir=args.output_dir,
         strategy=args.strategy,
     )
 
-    pipeline.run_full_pipeline(
-        scrape_articles=not args.no_scrape,
-        scrape_limit=args.scrape_limit,
-        enrich_geo=not args.no_geo,  # Default: ENABLED
-        deduplicate=not args.no_dedupe,  # Default: ENABLED
-    )
+    if args.mode == "daily":
+        pipeline.run_daily_pipeline(scrape_limit=args.scrape_limit)
+    else:
+        pipeline.run_full_pipeline(
+            scrape_articles=not args.no_scrape,
+            scrape_limit=args.scrape_limit,
+            enrich_geo=not args.no_geo,
+            deduplicate=not args.no_dedupe,
+        )
 
 
 if __name__ == "__main__":

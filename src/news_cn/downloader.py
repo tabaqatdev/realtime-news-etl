@@ -26,7 +26,10 @@ class GDELTDownloader:
         self.last_update_url = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt"
 
     def get_available_files(
-        self, start_date: datetime, data_types: list[str] | None = None
+        self,
+        start_date: datetime,
+        end_date: datetime | None = None,
+        data_types: list[str] | None = None,
     ) -> list[tuple[str, str]]:
         """
         Get list of available GDELT files from master file list
@@ -69,8 +72,10 @@ class GDELTDownloader:
                 date_str = filename[:8]
                 file_date = datetime.strptime(date_str, "%Y%m%d")
 
-                # Filter by date
+                # Filter by date range
                 if file_date < start_date:
+                    continue
+                if end_date and file_date > end_date:
                     continue
 
                 # Filter by data type

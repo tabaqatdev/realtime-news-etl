@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 def collect_news(
     country: str = "SA",
     start_date: datetime | str | None = None,
+    end_date: datetime | str | None = None,
     data_types: list[str] | None = None,
     output_dir: str = "data/parquet",
     strategy: str = "batch",
@@ -57,6 +58,10 @@ def collect_news(
 
     config.START_DATE = start_date
 
+    # Parse end date
+    if end_date is not None and isinstance(end_date, str):
+        end_date = datetime.strptime(end_date, "%Y-%m-%d")
+
     # Set data types
     if data_types:
         config.DATA_TYPES = data_types
@@ -67,7 +72,9 @@ def collect_news(
 
     # Get available files
     logger.info(f"Fetching GDELT files from {start_date.date()}...")
-    file_list = downloader.get_available_files(start_date=start_date, data_types=config.DATA_TYPES)
+    file_list = downloader.get_available_files(
+        start_date=start_date, end_date=end_date, data_types=config.DATA_TYPES
+    )
 
     if not file_list:
         logger.warning("No files found for specified criteria")

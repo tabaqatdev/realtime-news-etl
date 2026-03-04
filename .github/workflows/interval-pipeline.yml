@@ -1,0 +1,60 @@
+name: 15-Min GDELT Pipeline
+
+on:
+  schedule:
+    - cron: "3 */6 * * *" # 4 times/day (00:03, 06:03, 12:03, 18:03 UTC)
+  workflow_dispatch:
+    inputs:
+      country:
+        description: "Comma-separated country codes"
+        default: "SA,AE,QA,KW,BH,OM,IS"
+      retention_days:
+        description: "Days of data to keep in GeoPackage"
+        default: "7"
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - run: uv python install 3.12
+      - run: uv sync
+      - run: uv run playwright install chromium --with-deps
+
+      - name: Download current GeoPackage from MinIO
+        if: vars.MINIO_BUCKET != ''
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+        run: |
+          pip install awscli
+          aws s3 cp \
+            "s3://${{ vars.MINIO_BUCKET }}/${{ vars.MINIO_PREFIX }}/events.gpkg" \
+            "data/output/events.gpkg" \
+            --endpoint-url "${{ vars.MINIO_ENDPOINT_URL }}" || true
+
+      - name: Run interval pipeline
+        run: |
+          uv run news-cn \
+            --country "${{ inputs.country || 'SA,AE,QA,KW,BH,OM,IS' }}" \
+            --retention-days ${{ inputs.retention_days || '7' }} \
+            --mode interval
+
+      - name: Upload GeoPackage to MinIO
+        if: success() && vars.MINIO_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+        run: |
+          aws s3 sync \
+            data/output/ \
+            "s3://${{ vars.MINIO_BUCKET }}/${{ vars.MINIO_PREFIX }}/" \
+            --endpoint-url "${{ vars.MINIO_ENDPOINT_URL }}" \
+            --size-only

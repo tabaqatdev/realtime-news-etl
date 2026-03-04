@@ -121,6 +121,44 @@ class GDELTDownloader:
 
         return files
 
+    def get_latest_export_update(self) -> tuple[str, str] | None:
+        """
+        Get the latest 15-minute export (events) update file.
+
+        Returns:
+            Tuple of (timestamp, url) for the export file, or None if not found.
+            Timestamp format: YYYYMMDDHHMMSS
+        """
+        files = self.get_latest_update()
+        for _size, url in files:
+            filename = Path(url).name
+            if ".export." in filename.lower():
+                # Extract timestamp from filename like 20260305001500.export.CSV.zip
+                timestamp = filename.split(".")[0]
+                logger.info(f"Latest export update: {timestamp} → {filename}")
+                return (timestamp, url)
+        logger.warning("No export file found in latest update")
+        return None
+
+    def download_and_extract(self, url: str) -> Path | None:
+        """
+        Download a single GDELT ZIP and extract the CSV.
+
+        Args:
+            url: URL of the ZIP file to download
+
+        Returns:
+            Path to extracted CSV file, or None if failed
+        """
+        zip_path = self.download_file(url)
+        if zip_path is None:
+            return None
+        csv_path = self.extract_zip(zip_path)
+        # Clean up the zip file
+        if csv_path and zip_path.exists():
+            zip_path.unlink()
+        return csv_path
+
     def download_file(self, file_url: str, file_size: str | None = None) -> Path | None:
         """
         Download a single GDELT file

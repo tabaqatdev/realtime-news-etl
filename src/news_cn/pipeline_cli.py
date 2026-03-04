@@ -8,6 +8,7 @@ Modes:
 """
 
 import logging
+import shutil
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -15,9 +16,13 @@ import duckdb
 
 from .data_cleaner import clean_events_data, validate_data_quality
 from .deduplicator import SmartDeduplicator
+from .downloader import GDELTDownloader
 from .geo_corrector import GeoCorrector
 from .modern_scraper import ModernArticleScraper
+from .schemas import SchemaFactory
 from .simple import collect_news, query_news
+
+DEFAULT_INTERVAL_COUNTRIES = "SA,AE,QA,KW,BH,OM,IS"
 
 logger = logging.getLogger(__name__)
 
@@ -274,9 +279,205 @@ class UnifiedPipeline:
         finally:
             con.close()
             # Clean up temp files
-            import shutil
-
             shutil.rmtree(tmp, ignore_errors=True)
+
+    # ─── Interval Mode (latest 15-min update → GeoPackage) ───────
+
+    def run_interval_pipeline(self, retention_days: int = 7):
+        """
+        Fetch the latest GDELT 15-minute update, run ETL (no scraping),
+        and maintain a rolling GeoPackage with the last N days of data.
+
+        Supports multiple countries via self.country (comma-separated codes).
+        Output: data/output/events.gpkg
+        """
+        import geopandas as gpd
+        import pandas as pd
+        from shapely.geometry import Point
+
+        start_time = datetime.now()
+        countries = [c.strip() for c in self.country.split(",")]
+        country_list_sql = ", ".join(f"'{c}'" for c in countries)
+
+        print(f"\n{'=' * 70}")
+        print("GDELT INTERVAL PIPELINE — Latest 15-min update")
+        print(f"{'=' * 70}")
+        print(f"  Countries: {', '.join(countries)}")
+        print(f"  Retention: {retention_days} days")
+
+        # 1. Get latest export update
+        downloader = GDELTDownloader(raw_data_dir=str(self.output_dir / "raw"))
+        update = downloader.get_latest_export_update()
+        if update is None:
+            print("  No export update available. Exiting.")
+            return
+        timestamp, url = update
+        print(f"  Update: {timestamp}")
+
+        # 2. Download and extract
+        csv_path = downloader.download_and_extract(url)
+        if csv_path is None:
+            print("  Failed to download/extract. Exiting.")
+            return
+
+        # 3. Read CSV, filter by country codes
+        tmp = self.output_dir / "tmp" / f"interval_{timestamp}"
+        tmp.mkdir(parents=True, exist_ok=True)
+
+        schema = SchemaFactory.get_event_schema()
+        col_defs = schema.to_duckdb_string()
+
+        con = duckdb.connect(":memory:")
+        try:
+            raw_file = tmp / "raw.parquet"
+            con.execute(f"""
+                COPY (
+                    SELECT *
+                    FROM read_csv('{csv_path}',
+                        delim='\t', header=false, quote='',
+                        columns={{{col_defs}}})
+                    WHERE ActionGeo_CountryCode IN ({country_list_sql})
+                       OR Actor1Geo_CountryCode IN ({country_list_sql})
+                       OR Actor2Geo_CountryCode IN ({country_list_sql})
+                ) TO '{raw_file}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """)
+            raw_count = con.execute(f"SELECT count(*) FROM read_parquet('{raw_file}')").fetchone()[
+                0
+            ]
+            print(f"  Raw records (filtered): {raw_count:,}")
+
+            if raw_count == 0:
+                print("  No matching records. Exiting.")
+                return
+
+            # 4. Clean
+            cleaned_file = tmp / "cleaned.parquet"
+            con.execute(f"""
+                COPY (
+                    SELECT DISTINCT *
+                    FROM read_parquet('{raw_file}')
+                    WHERE GLOBALEVENTID IS NOT NULL
+                      AND SQLDATE IS NOT NULL
+                      AND SOURCEURL IS NOT NULL AND SOURCEURL != ''
+                      AND AvgTone BETWEEN -10.0 AND 10.0
+                    ORDER BY SQLDATE DESC, DATEADDED DESC
+                ) TO '{cleaned_file}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """)
+            cleaned_count = con.execute(
+                f"SELECT count(*) FROM read_parquet('{cleaned_file}')"
+            ).fetchone()[0]
+            print(f"  Cleaned: {cleaned_count:,}")
+
+            # 5. Deduplicate
+            deduped_file = tmp / "deduped.parquet"
+            deduplicator = SmartDeduplicator()
+            try:
+                deduplicator.deduplicate_by_url(str(cleaned_file), str(deduped_file))
+                deduped_count = con.execute(
+                    f"SELECT count(*) FROM read_parquet('{deduped_file}')"
+                ).fetchone()[0]
+                print(f"  Deduplicated: {deduped_count:,}")
+            finally:
+                deduplicator.close()
+
+            # 6. Geo-enrich
+            geo_file = tmp / "geo.parquet"
+            corrector = GeoCorrector()
+            try:
+                corrector.enrich_with_reference_data(str(deduped_file), str(geo_file))
+                print("  Geo-enriched")
+            except Exception as e:
+                logger.warning(f"  Geo-enrichment failed: {e}, using deduped file")
+                geo_file = deduped_file
+            finally:
+                corrector.close()
+
+            # 7. Scrape articles
+            articles_file = tmp / "articles.parquet"
+            scraper = ModernArticleScraper()
+            scraper.enrich_events_with_content(
+                parquet_pattern=str(geo_file),
+                limit=500,
+                output_file=articles_file,
+                events_file=str(geo_file),
+                final_output_file=None,
+            )
+
+            # 8. Merge events + articles (LEFT JOIN)
+            final_file = tmp / "final.parquet"
+            if articles_file.exists():
+                scraper.merge_articles_with_events(
+                    events_parquet=str(geo_file),
+                    articles_parquet=str(articles_file),
+                    output_parquet=str(final_file),
+                    only_with_articles=False,
+                )
+            else:
+                # No articles scraped — add NULL article columns
+                con.execute(f"""
+                    COPY (
+                        SELECT *,
+                            NULL::VARCHAR as ArticleTitle,
+                            NULL::VARCHAR as ArticleContent,
+                            NULL::VARCHAR as ArticleAuthor,
+                            NULL::VARCHAR as ArticlePublishDate,
+                            NULL::BIGINT as ArticleContentLength,
+                            NULL::VARCHAR as ArticleScrapeMethod
+                        FROM read_parquet('{geo_file}')
+                    ) TO '{final_file}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                """)
+
+            source_file = final_file if final_file.exists() else geo_file
+            stats = con.execute(f"""
+                SELECT count(*) as total, count(ArticleTitle) as with_articles
+                FROM read_parquet('{source_file}')
+            """).fetchone()
+            print(f"  Articles: {stats[1]:,}/{stats[0]:,} events with content")
+
+            # 9. Convert to GeoDataFrame
+            df = pd.read_parquet(str(source_file))
+            # Only create geometry where we have coordinates
+            has_coords = df["ActionGeo_Lat"].notna() & df["ActionGeo_Long"].notna()
+            geometry = [
+                Point(row["ActionGeo_Long"], row["ActionGeo_Lat"]) if has else None
+                for has, (_, row) in zip(has_coords, df.iterrows(), strict=False)
+            ]
+            gdf_new = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+            print(f"  GeoDataFrame: {len(gdf_new):,} records, {has_coords.sum():,} with geometry")
+
+            # 10. Append to GeoPackage with rolling window
+            gpkg_path = self.output_dir / "output" / "events.gpkg"
+            gpkg_path.parent.mkdir(parents=True, exist_ok=True)
+
+            cutoff_date = int((date.today() - timedelta(days=retention_days)).strftime("%Y%m%d"))
+
+            if gpkg_path.exists():
+                gdf_existing = gpd.read_file(gpkg_path, layer="events")
+                print(f"  Existing GeoPackage: {len(gdf_existing):,} records")
+
+                # Concat and deduplicate by GLOBALEVENTID
+                gdf_combined = pd.concat([gdf_existing, gdf_new], ignore_index=True)
+                gdf_combined = gdf_combined.drop_duplicates(subset=["GLOBALEVENTID"], keep="last")
+
+                # Prune old records
+                gdf_combined = gdf_combined[gdf_combined["SQLDATE"] >= cutoff_date]
+                gdf_combined = gpd.GeoDataFrame(gdf_combined, geometry="geometry", crs="EPSG:4326")
+            else:
+                gdf_combined = gdf_new[gdf_new["SQLDATE"] >= cutoff_date]
+
+            gdf_combined.to_file(str(gpkg_path), driver="GPKG", layer="events")
+            print(f"  GeoPackage written: {len(gdf_combined):,} records → {gpkg_path}")
+
+        finally:
+            con.close()
+            # Clean up temp files and downloaded CSV
+            shutil.rmtree(tmp, ignore_errors=True)
+            if csv_path.exists():
+                csv_path.unlink(missing_ok=True)
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print(f"\n  Done in {elapsed:.1f}s")
+        print(f"{'=' * 70}")
 
     # ─── Full Mode (legacy: one combined file) ────────────────────
 
@@ -529,8 +730,11 @@ Examples:
   # Daily mode: backfill from Jan 1 to Feb 7
   news-cn --mode daily --start-date 2026-01-01 --end-date 2026-02-07
 
-  # Daily mode: process a single specific day
-  news-cn --mode daily --start-date 2026-02-07 --end-date 2026-02-07
+  # Interval mode: latest 15-min update for Gulf + Israel → GeoPackage
+  news-cn --mode interval
+
+  # Interval mode: custom countries and retention
+  news-cn --mode interval --country SA,AE,QA --retention-days 14
 
   # Full mode (legacy): all data into one file
   news-cn --mode full --scrape-limit 99999
@@ -540,7 +744,12 @@ Examples:
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--country", default="SA", help="Country code (default: SA)")
+    parser.add_argument(
+        "--country",
+        default=None,
+        help="Country code(s), comma-separated (default: SA for daily/full, "
+        "SA,AE,QA,KW,BH,OM,IS for interval)",
+    )
     parser.add_argument(
         "--start-date",
         default=default_start,
@@ -560,9 +769,16 @@ Examples:
     )
     parser.add_argument(
         "--mode",
-        choices=["full", "daily"],
+        choices=["full", "daily", "interval"],
         default="daily",
-        help="Pipeline mode: 'daily' (per-day files, recommended) or 'full' (one combined file)",
+        help="Pipeline mode: 'daily' (per-day files), 'interval' (15-min update → GeoPackage), "
+        "or 'full' (one combined file)",
+    )
+    parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=7,
+        help="Days of data to keep in GeoPackage (interval mode, default: 7)",
     )
     parser.add_argument("--no-scrape", action="store_true", help="Skip article scraping step")
     parser.add_argument(
@@ -578,15 +794,23 @@ Examples:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+    # Resolve country default based on mode
+    if args.country is None:
+        country = DEFAULT_INTERVAL_COUNTRIES if args.mode == "interval" else "SA"
+    else:
+        country = args.country
+
     pipeline = UnifiedPipeline(
-        country=args.country,
+        country=country,
         start_date=args.start_date,
         end_date=args.end_date,
         output_dir=args.output_dir,
         strategy=args.strategy,
     )
 
-    if args.mode == "daily":
+    if args.mode == "interval":
+        pipeline.run_interval_pipeline(retention_days=args.retention_days)
+    elif args.mode == "daily":
         pipeline.run_daily_pipeline(scrape_limit=args.scrape_limit)
     else:
         pipeline.run_full_pipeline(
